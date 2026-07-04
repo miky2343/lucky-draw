@@ -7109,7 +7109,7 @@ var LuckyDrawView_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @
 			])], 64);
 		};
 	}
-}), [["__scopeId", "data-v-ce8e3886"]]);
+}), [["__scopeId", "data-v-a87c9af8"]]);
 //#endregion
 //#region src/router/index.ts
 var router = createRouter({
