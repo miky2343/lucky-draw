@@ -6242,15 +6242,15 @@ var namesText = /* @__PURE__ */ ref("");
 /** 獎項清單，預設一個「得獎」1 名 */
 var prizes = /* @__PURE__ */ ref([{
 	id: 1,
-	name: "得獎",
+	name: "獎項1",
 	count: 1
 }]);
 /** 下一個新增獎項要指派的自增 id */
 var pid = 2;
-/** 是否對名單去重（大小寫不敏感） */
-var dedupe = /* @__PURE__ */ ref(false);
-/** 是否不重複抽出（同一人只會中一次，用抽袋 pop 實作） */
-var onceOnly = /* @__PURE__ */ ref(true);
+/** 抽獎方式：once（一次抽出）/ staged（分次逐獎抽出） */
+var drawMode = /* @__PURE__ */ ref("once");
+/** 中獎規則：repeat（可重複中獎）/ unique（最多一次·全場一人一獎） */
+var winRule = /* @__PURE__ */ ref("unique");
 /** 抽獎流程狀態機：idle（待機）→ rolling（滾動動畫）→ results（揭曉） */
 var phase = /* @__PURE__ */ ref("idle");
 /** 滾動階段畫面上快速變換的名字 */
@@ -6259,6 +6259,8 @@ var rollingName = /* @__PURE__ */ ref("");
 var groups = /* @__PURE__ */ ref([]);
 /** 目前已揭曉的得獎者總數，驅動逐一浮現動畫 */
 var revealedCount = /* @__PURE__ */ ref(0);
+/** 分次抽出時目前抽到第幾個獎項（0-based）；一次抽出時不使用 */
+var stageIndex = /* @__PURE__ */ ref(0);
 /** 是否正在抽獎中（滾動或揭曉未完成），用來擋重複觸發 */
 var drawing = /* @__PURE__ */ ref(false);
 /** 滾動名字用的 setInterval id */
@@ -6267,30 +6269,32 @@ var rollTimer;
 var revealTimer;
 var { toast } = useToast();
 var { launch: launchConfetti, clear: clearConfetti } = useConfetti();
-/** 解析後的有效參加名單：依換行／逗號切分、去空白，並視 dedupe 去重 */
-var pool = computed(() => {
-	let raw = namesText.value.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
-	if (dedupe.value) {
-		const seen = /* @__PURE__ */ new Set();
-		raw = raw.filter((n) => {
-			const k = n.toLowerCase();
-			if (seen.has(k)) return false;
-			seen.add(k);
-			return true;
-		});
-	}
-	return raw;
-});
-/** 有效參加人數 */
+/** 解析後的有效參加名單：依換行／逗號切分、去空白。
+* 一律保留重複——每一筆（含重複）都是一張抽獎券，重複越多票越多、機率越高（加權抽樣）。 */
+var pool = computed(() => namesText.value.split(/[\n,]/).map((s) => s.trim()).filter(Boolean));
+/** 有效抽獎券總數（含重複，代表加權後的抽選項數） */
 var validCount = computed(() => pool.value.length);
+/** 不重複的人數（大小寫不敏感）：unique 全場、或 repeat 單一獎項可產生的得獎者上限 */
+var uniqueCount = computed(() => new Set(pool.value.map((n) => n.toLowerCase())).size);
 /** 所有獎項合計需要的名額數 */
 var need = computed(() => prizes.value.reduce((s, p) => s + (Number(p.count) || 0), 0));
-/** 名額是否超過人數（僅在不重複模式下才成立） */
-var short = computed(() => onceOnly.value && need.value > pool.value.length);
+/** 單一獎項的最大名額數（repeat 模式判斷該獎項是否會從缺用） */
+var maxPrizeCount = computed(() => prizes.value.reduce((m, p) => Math.max(m, Number(p.count) || 0), 0));
+/** 名額是否超過可產生的得獎者上限（超過的名額會從缺）：
+* unique 看「總名額 vs 不重複人數」；repeat 看「單一獎項最大名額 vs 不重複人數」。 */
+var short = computed(() => winRule.value === "unique" ? need.value > uniqueCount.value : maxPrizeCount.value > uniqueCount.value);
 /** 是否已離開待機狀態（已抽過或抽獎中） */
 var drawn = computed(() => phase.value !== "idle");
-/** 是否顯示結果工具列（結果已全部揭曉完畢時） */
-var showTools = computed(() => phase.value === "results" && !drawing.value);
+/** 是否為分次抽出模式 */
+var isStaged = computed(() => drawMode.value === "staged");
+/** 是否還有下一個獎項可抽（分次抽出、目前獎項已揭曉完、且尚未抽到最後一個獎項） */
+var canNextStage = computed(() => isStaged.value && phase.value === "results" && !drawing.value && stageIndex.value < groups.value.length - 1);
+/** 「下一獎」按鈕文案 */
+var stageLabel = computed(() => "下一獎");
+/** 結果區是否該顯示（已進入揭曉，或分次抽出時已有先前揭曉的獎項） */
+var resultsVisible = computed(() => phase.value === "results" || revealedCount.value > 0);
+/** 是否顯示結果工具列（全部揭曉完畢、且無下一獎可抽時） */
+var showTools = computed(() => phase.value === "results" && !drawing.value && !canNextStage.value);
 /** 依 revealedCount 切出各組「已揭曉」的得獎者子集，供逐一揭曉動畫 */
 var revealedGroups = computed(() => {
 	let remaining = revealedCount.value;
@@ -6303,20 +6307,6 @@ var revealedGroups = computed(() => {
 		};
 	});
 });
-/**
-* Fisher–Yates 原地洗牌，會直接修改傳入的陣列。
-* @param a 要洗牌的陣列
-* @returns 同一個（已洗牌）陣列
-*/
-function shuffle(a) {
-	for (let i = a.length - 1; i > 0; i--) {
-		const j = Math.floor(Math.random() * (i + 1));
-		const tmp = a[i];
-		a[i] = a[j];
-		a[j] = tmp;
-	}
-	return a;
-}
 /**
 * 依 index 循環取獎項色盤中的顏色（帶 fallback，滿足 noUncheckedIndexedAccess）。
 * @param i 獎項索引
@@ -6366,18 +6356,33 @@ function removePrize(id) {
 }
 /**
 * 一次算完所有獎項的得獎者（結果先定案，後續動畫僅為呈現）。
-* 不重複模式用共用抽袋 `bag.pop()`，避免跨獎項重複中獎；
-* 可重複模式則每個名額各自隨機抽取。
+*
+* 名單不去重＝加權抽樣（每筆重複是一張抽獎券）。兩規則共用同一抽法
+* 「加權抽出一名 → 移除該人所有票券 → 抽下一名」，差別只在抽獎袋的重置時機：
+* - `unique`：全程共用一個袋，永不重置 → 全場一人一獎。
+* - `repeat`：每個獎項各自複製一份原始名單 → 同一獎項內每人限一個名額，換獎項可再中。
+*
+* 名額多於袋內不重複人數時，抽不到的名額會從缺。
 * @returns 各獎項的得獎結果陣列
 */
 function computeGroups() {
-	const bag = shuffle(pool.value.slice());
+	const perPrizeReset = winRule.value === "repeat";
+	let bag = pool.value.slice();
+	const drawFrom = () => {
+		if (!bag.length) return void 0;
+		const name = bag[Math.floor(Math.random() * bag.length)];
+		const key = name.toLowerCase();
+		bag = bag.filter((n) => n.toLowerCase() !== key);
+		return name;
+	};
 	return prizes.value.map((p, i) => {
+		if (perPrizeReset) bag = pool.value.slice();
 		const c = Math.max(0, Number(p.count) || 0);
 		const winners = [];
-		for (let k = 0; k < c; k++) if (onceOnly.value) {
-			if (bag.length) winners.push(bag.pop());
-		} else winners.push(randomName());
+		for (let k = 0; k < c; k++) {
+			const w = drawFrom();
+			if (w) winners.push(w);
+		}
 		return {
 			name: p.name && p.name.trim() || "獎項 " + (i + 1),
 			color: prizeColor(i),
@@ -6405,13 +6410,10 @@ function runDraw() {
 		toast("請至少設定一個名額");
 		return;
 	}
-	if (onceOnly.value && need.value > pool.value.length) {
-		toast("名額比人數多，無法不重複抽出");
-		return;
-	}
 	drawing.value = true;
 	groups.value = computeGroups();
 	revealedCount.value = 0;
+	stageIndex.value = 0;
 	phase.value = "rolling";
 	clearConfetti();
 	rollingName.value = pool.value[0] ?? "";
@@ -6419,20 +6421,47 @@ function runDraw() {
 	rollTimer = window.setInterval(() => {
 		rollingName.value = randomName();
 	}, 65);
-	revealTimer = window.setTimeout(beginReveal, 1800);
+	revealTimer = window.setTimeout(revealStage, 1800);
+}
+/**
+* 分次抽出時，使用者按「下一獎」推進到下一個獎項：
+* 再跑一段滾動動畫後揭曉下一獎。無下一獎可抽時忽略。
+*/
+function nextStage() {
+	if (!canNextStage.value) return;
+	stageIndex.value++;
+	drawing.value = true;
+	phase.value = "rolling";
+	clearConfetti();
+	clearTimers();
+	rollTimer = window.setInterval(() => {
+		rollingName.value = randomName();
+	}, 65);
+	revealTimer = window.setTimeout(revealStage, 1200);
+}
+/**
+* 本階段要揭曉到的累計得獎人數上限：
+* 一次抽出＝全部；分次抽出＝到目前 stageIndex 為止的獎項累計。
+* @returns revealedCount 在本階段的目標值
+*/
+function stageTarget() {
+	if (!isStaged.value) return groups.value.reduce((a, g) => a + g.winners.length, 0);
+	let cum = 0;
+	for (let i = 0; i <= stageIndex.value && i < groups.value.length; i++) cum += groups.value[i].winners.length;
+	return cum;
 }
 /**
 * 揭曉階段：停掉滾動、切到 results 階段並放彩帶，
-* 再用遞迴 setTimeout（每 360ms）逐一遞增 revealedCount，
-* 全部揭曉完畢後把 drawing 設回 false。
+* 再用遞迴 setTimeout（每 360ms）逐一遞增 revealedCount 至本階段目標。
+* 分次抽出時目標僅到目前獎項，抵達後停下等待「下一獎」。
 */
-function beginReveal() {
+function revealStage() {
 	clearInterval(rollTimer);
 	phase.value = "results";
 	launchConfetti();
-	const total = groups.value.reduce((a, g) => a + g.winners.length, 0);
+	const target = stageTarget();
 	const step = () => {
-		if (revealedCount.value >= total) {
+		if (revealedCount.value >= target) {
 			drawing.value = false;
 			return;
 		}
@@ -6461,23 +6490,28 @@ function useLuckyDraw() {
 	return {
 		namesText,
 		prizes,
-		dedupe,
-		onceOnly,
+		drawMode,
+		winRule,
 		phase,
 		rollingName,
 		drawing,
 		pool,
 		validCount,
+		uniqueCount,
 		need,
 		short,
 		drawn,
 		showTools,
 		revealedGroups,
+		canNextStage,
+		stageLabel,
+		resultsVisible,
 		importFile,
 		clearNames,
 		addPrize,
 		removePrize,
 		runDraw,
+		nextStage,
 		copy,
 		prizeColor
 	};
@@ -6627,47 +6661,65 @@ var AButton_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @__PURE
 			}, [renderSlot(_ctx.$slots, "default", {}, void 0, true)], 2);
 		};
 	}
-}), [["__scopeId", "data-v-1126adfb"]]);
+}), [["__scopeId", "data-v-2a2ab567"]]);
 //#endregion
-//#region src/views/components/atoms/ASwitch.vue?vue&type=script&setup=true&lang.ts
-var _hoisted_1$8 = { class: "a-switch" };
-var _hoisted_2$6 = ["checked"];
-var _hoisted_3$4 = { key: 0 };
+//#region src/views/components/atoms/ARadioGroup.vue?vue&type=script&setup=true&lang.ts
+var _hoisted_1$8 = { class: "a-radioGroup" };
+var _hoisted_2$6 = {
+	key: 0,
+	class: "a-radioGroup__label"
+};
+var _hoisted_3$5 = { class: "a-radioGroup__options" };
+var _hoisted_4$3 = ["onClick"];
 //#endregion
-//#region src/views/components/atoms/ASwitch.vue
-var ASwitch_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @__PURE__ */ defineComponent({
-	__name: "ASwitch",
+//#region src/views/components/atoms/ARadioGroup.vue
+var ARadioGroup_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @__PURE__ */ defineComponent({
+	__name: "ARadioGroup",
 	props: {
-		modelValue: { type: Boolean },
+		modelValue: {},
+		options: {},
 		label: {}
 	},
 	emits: ["update:modelValue"],
 	setup(__props) {
 		return (_ctx, _cache) => {
-			return openBlock(), createElementBlock("label", _hoisted_1$8, [
-				createBaseVNode("input", {
-					class: "a-switch__input",
-					type: "checkbox",
-					checked: __props.modelValue,
-					onChange: _cache[0] || (_cache[0] = ($event) => _ctx.$emit("update:modelValue", $event.target.checked))
-				}, null, 40, _hoisted_2$6),
-				_cache[1] || (_cache[1] = createBaseVNode("span", { class: "a-switch__track" }, null, -1)),
-				__props.label ? (openBlock(), createElementBlock("span", _hoisted_3$4, toDisplayString(__props.label), 1)) : createCommentVNode("", true)
-			]);
+			return openBlock(), createElementBlock("div", _hoisted_1$8, [__props.label ? (openBlock(), createElementBlock("span", _hoisted_2$6, toDisplayString(__props.label), 1)) : createCommentVNode("", true), createBaseVNode("div", _hoisted_3$5, [(openBlock(true), createElementBlock(Fragment, null, renderList(__props.options, (opt) => {
+				return openBlock(), createElementBlock("button", {
+					key: opt.value,
+					type: "button",
+					class: normalizeClass(["a-radioGroup__opt", { "is-active": opt.value === __props.modelValue }]),
+					onClick: ($event) => _ctx.$emit("update:modelValue", opt.value)
+				}, toDisplayString(opt.label), 11, _hoisted_4$3);
+			}), 128))])]);
 		};
 	}
-}), [["__scopeId", "data-v-ac08338c"]]);
+}), [["__scopeId", "data-v-ebf1c529"]]);
 //#endregion
 //#region src/views/components/organisms/ONamesPanel.vue?vue&type=script&setup=true&lang.ts
 var _hoisted_1$7 = { class: "m-card__tools" };
-var _hoisted_2$5 = { class: "m-toggleList" };
+var _hoisted_2$5 = { class: "m-options" };
+var _hoisted_3$4 = { class: "m-options__note" };
 var namesPlaceholder = "每行一個名字，例如：\n王小明\n陳美麗\n林大同\n\n也可貼上用逗號分隔的名單";
 //#endregion
 //#region src/views/components/organisms/ONamesPanel.vue
 var ONamesPanel_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @__PURE__ */ defineComponent({
 	__name: "ONamesPanel",
 	setup(__props) {
-		const { namesText, validCount, dedupe, onceOnly, importFile, clearNames } = useLuckyDraw();
+		const { namesText, validCount, drawMode, winRule, importFile, clearNames } = useLuckyDraw();
+		const drawModeOptions = [{
+			value: "once",
+			label: "一次抽出"
+		}, {
+			value: "staged",
+			label: "分次抽出"
+		}];
+		const winRuleOptions = [{
+			value: "repeat",
+			label: "可重複中獎"
+		}, {
+			value: "unique",
+			label: "最多中獎一次"
+		}];
 		const fileInput = /* @__PURE__ */ ref();
 		function onFile(e) {
 			const input = e.target;
@@ -6722,21 +6774,27 @@ var ONamesPanel_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @__
 							_: 1
 						}, 8, ["onClick"])
 					]),
-					createBaseVNode("div", _hoisted_2$5, [createVNode(ASwitch_default, {
-						modelValue: unref(dedupe),
-						"onUpdate:modelValue": _cache[2] || (_cache[2] = ($event) => /* @__PURE__ */ isRef(dedupe) ? dedupe.value = $event : null),
-						label: "移除重複的名字"
-					}, null, 8, ["modelValue"]), createVNode(ASwitch_default, {
-						modelValue: unref(onceOnly),
-						"onUpdate:modelValue": _cache[3] || (_cache[3] = ($event) => /* @__PURE__ */ isRef(onceOnly) ? onceOnly.value = $event : null),
-						label: "每人最多中獎一次"
-					}, null, 8, ["modelValue"])])
+					createBaseVNode("div", _hoisted_2$5, [
+						createVNode(ARadioGroup_default, {
+							modelValue: unref(drawMode),
+							"onUpdate:modelValue": _cache[2] || (_cache[2] = ($event) => /* @__PURE__ */ isRef(drawMode) ? drawMode.value = $event : null),
+							label: "抽獎方式",
+							options: drawModeOptions
+						}, null, 8, ["modelValue"]),
+						createVNode(ARadioGroup_default, {
+							modelValue: unref(winRule),
+							"onUpdate:modelValue": _cache[3] || (_cache[3] = ($event) => /* @__PURE__ */ isRef(winRule) ? winRule.value = $event : null),
+							label: "中獎規則",
+							options: winRuleOptions
+						}, null, 8, ["modelValue"]),
+						createBaseVNode("p", _hoisted_3$4, toDisplayString(unref(winRule) === "unique" ? "重複名單越多、機率越高；全場每人最多中一個獎項" : "同一獎項每人限中一次，可再中其他獎項"), 1)
+					])
 				]),
 				_: 1
 			});
 		};
 	}
-}), [["__scopeId", "data-v-dcdba142"]]);
+}), [["__scopeId", "data-v-67242298"]]);
 //#endregion
 //#region src/views/components/molecules/MNumberStepper.vue?vue&type=script&setup=true&lang.ts
 var _hoisted_1$6 = { class: "m-numberStepper" };
@@ -6836,7 +6894,7 @@ var MPrizeRow_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @__PU
 			]);
 		};
 	}
-}), [["__scopeId", "data-v-73a8978b"]]);
+}), [["__scopeId", "data-v-66cd7ffd"]]);
 //#endregion
 //#region src/views/components/molecules/MNeedLine.vue
 var MNeedLine_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @__PURE__ */ defineComponent({
@@ -6849,21 +6907,19 @@ var MNeedLine_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @__PU
 	setup(__props) {
 		return (_ctx, _cache) => {
 			return openBlock(), createElementBlock("div", { class: normalizeClass(["m-needLine", { "is-warning": __props.short }]) }, [__props.short ? (openBlock(), createElementBlock(Fragment, { key: 0 }, [
-				_cache[0] || (_cache[0] = createTextVNode("名額共 ", -1)),
-				createBaseVNode("b", null, toDisplayString(__props.need), 1),
-				_cache[1] || (_cache[1] = createTextVNode(" 個，但名單只有 ", -1)),
+				_cache[0] || (_cache[0] = createTextVNode("有獎項名額超過名單人數（", -1)),
 				createBaseVNode("b", null, toDisplayString(__props.pool), 1),
-				_cache[2] || (_cache[2] = createTextVNode(" 人，請補名單或減少名額", -1))
+				_cache[1] || (_cache[1] = createTextVNode(" 人），超出的名額將從缺", -1))
 			], 64)) : (openBlock(), createElementBlock(Fragment, { key: 1 }, [
-				_cache[3] || (_cache[3] = createTextVNode("需要 ", -1)),
+				_cache[2] || (_cache[2] = createTextVNode("需要 ", -1)),
 				createBaseVNode("b", null, toDisplayString(__props.need), 1),
-				_cache[4] || (_cache[4] = createTextVNode(" 名得獎者，目前名單有 ", -1)),
+				_cache[3] || (_cache[3] = createTextVNode(" 名得獎者，目前名單有 ", -1)),
 				createBaseVNode("b", null, toDisplayString(__props.pool), 1),
-				_cache[5] || (_cache[5] = createTextVNode(" 人", -1))
+				_cache[4] || (_cache[4] = createTextVNode(" 人", -1))
 			], 64))], 2);
 		};
 	}
-}), [["__scopeId", "data-v-4d3d0855"]]);
+}), [["__scopeId", "data-v-4be6a5b8"]]);
 //#endregion
 //#region src/views/components/organisms/OPrizesPanel.vue?vue&type=script&setup=true&lang.ts
 var _hoisted_1$4 = { class: "m-prizeList" };
@@ -6872,7 +6928,7 @@ var _hoisted_1$4 = { class: "m-prizeList" };
 var OPrizesPanel_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @__PURE__ */ defineComponent({
 	__name: "OPrizesPanel",
 	setup(__props) {
-		const { prizes, need, pool, short, addPrize, removePrize, prizeColor } = useLuckyDraw();
+		const { prizes, need, uniqueCount, short, addPrize, removePrize, prizeColor } = useLuckyDraw();
 		return (_ctx, _cache) => {
 			return openBlock(), createBlock(MCard_default, null, {
 				default: withCtx(() => [
@@ -6922,7 +6978,7 @@ var OPrizesPanel_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @_
 					}, 8, ["onClick"]),
 					createVNode(MNeedLine_default, {
 						need: unref(need),
-						pool: unref(pool).length,
+						pool: unref(uniqueCount),
 						short: unref(short)
 					}, null, 8, [
 						"need",
@@ -6934,7 +6990,7 @@ var OPrizesPanel_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @_
 			});
 		};
 	}
-}), [["__scopeId", "data-v-d813cac3"]]);
+}), [["__scopeId", "data-v-5990920b"]]);
 //#endregion
 //#region src/views/components/atoms/AWinnerChip.vue?vue&type=script&setup=true&lang.ts
 var _hoisted_1$3 = {
@@ -7019,16 +7075,12 @@ var _hoisted_8 = { class: "o-stage__grid" };
 var OStage_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @__PURE__ */ defineComponent({
 	__name: "OStage",
 	setup(__props) {
-		const { phase, rollingName, revealedGroups, showTools, runDraw, copy } = useLuckyDraw();
+		const { phase, rollingName, revealedGroups, showTools, resultsVisible, copy } = useLuckyDraw();
 		return (_ctx, _cache) => {
-			return unref(phase) !== "idle" ? (openBlock(), createElementBlock("section", _hoisted_1$1, [unref(phase) === "rolling" ? (openBlock(), createElementBlock("div", _hoisted_2$1, [_cache[2] || (_cache[2] = createBaseVNode("div", { class: "o-stage__label" }, "正在抽出幸運得主…", -1)), createBaseVNode("div", _hoisted_3$1, [createBaseVNode("span", _hoisted_4$1, toDisplayString(unref(rollingName)), 1)])])) : (openBlock(), createElementBlock("div", _hoisted_5$1, [createBaseVNode("div", _hoisted_6, [_cache[3] || (_cache[3] = createBaseVNode("h2", { class: "o-stage__title" }, [createBaseVNode("span", { class: "o-stage__dot" }), createTextVNode("得獎名單")], -1)), unref(showTools) ? (openBlock(), createElementBlock("div", _hoisted_7, [createBaseVNode("button", {
-				class: "o-stage__btn -redraw",
-				type: "button",
-				onClick: _cache[0] || (_cache[0] = (...args) => unref(runDraw) && unref(runDraw)(...args))
-			}, "重新抽獎"), createBaseVNode("button", {
+			return unref(phase) !== "idle" ? (openBlock(), createElementBlock("section", _hoisted_1$1, [unref(phase) === "rolling" ? (openBlock(), createElementBlock("div", _hoisted_2$1, [_cache[1] || (_cache[1] = createBaseVNode("div", { class: "o-stage__label" }, "正在抽出幸運得主…", -1)), createBaseVNode("div", _hoisted_3$1, [createBaseVNode("span", _hoisted_4$1, toDisplayString(unref(rollingName)), 1)])])) : createCommentVNode("", true), unref(resultsVisible) ? (openBlock(), createElementBlock("div", _hoisted_5$1, [createBaseVNode("div", _hoisted_6, [_cache[2] || (_cache[2] = createBaseVNode("h2", { class: "o-stage__title" }, [createBaseVNode("span", { class: "o-stage__dot" }), createTextVNode("得獎名單")], -1)), unref(showTools) ? (openBlock(), createElementBlock("div", _hoisted_7, [createBaseVNode("button", {
 				class: "o-stage__btn -copy",
 				type: "button",
-				onClick: _cache[1] || (_cache[1] = (...args) => unref(copy) && unref(copy)(...args))
+				onClick: _cache[0] || (_cache[0] = (...args) => unref(copy) && unref(copy)(...args))
 			}, "複製結果")])) : createCommentVNode("", true)]), createBaseVNode("div", _hoisted_8, [(openBlock(true), createElementBlock(Fragment, null, renderList(unref(revealedGroups), (g, i) => {
 				return openBlock(), createBlock(MResultCard_default, {
 					key: i,
@@ -7044,10 +7096,10 @@ var OStage_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @__PURE_
 					"revealed",
 					"empty"
 				]);
-			}), 128))])]))])) : createCommentVNode("", true);
+			}), 128))])])) : createCommentVNode("", true)])) : createCommentVNode("", true);
 		};
 	}
-}), [["__scopeId", "data-v-e9be54a1"]]);
+}), [["__scopeId", "data-v-c1e7c3a7"]]);
 //#endregion
 //#region src/views/components/atoms/AToast.vue
 var AToast_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @__PURE__ */ defineComponent({
@@ -7078,7 +7130,7 @@ var _hoisted_5 = { class: "t-draw__stage" };
 var LuckyDrawView_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @__PURE__ */ defineComponent({
 	__name: "LuckyDrawView",
 	setup(__props) {
-		const { need, drawn, drawing, runDraw } = useLuckyDraw();
+		const { need, drawn, drawing, canNextStage, stageLabel, runDraw, nextStage } = useLuckyDraw();
 		const { message, tone } = useToast();
 		return (_ctx, _cache) => {
 			return openBlock(), createElementBlock(Fragment, null, [createBaseVNode("div", _hoisted_1, [
@@ -7087,17 +7139,17 @@ var LuckyDrawView_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @
 				createBaseVNode("div", _hoisted_3, [createVNode(AButton_default, {
 					variant: "primary",
 					disabled: unref(drawing),
-					onClick: unref(runDraw)
+					onClick: _cache[0] || (_cache[0] = ($event) => unref(canNextStage) ? unref(nextStage)() : unref(runDraw)())
 				}, {
-					default: withCtx(() => [createTextVNode(toDisplayString(unref(drawn) ? "再抽一次" : "開始抽獎"), 1)]),
+					default: withCtx(() => [createTextVNode(toDisplayString(unref(canNextStage) ? unref(stageLabel) : unref(drawn) ? "再抽一次" : "開始抽獎"), 1)]),
 					_: 1
-				}, 8, ["disabled", "onClick"]), createBaseVNode("div", _hoisted_4, [
-					_cache[0] || (_cache[0] = createTextVNode("本次將抽出 ", -1)),
+				}, 8, ["disabled"]), createBaseVNode("div", _hoisted_4, [
+					_cache[1] || (_cache[1] = createTextVNode("本次將抽出 ", -1)),
 					createBaseVNode("b", null, toDisplayString(unref(need)), 1),
-					_cache[1] || (_cache[1] = createTextVNode(" 位得獎者", -1))
+					_cache[2] || (_cache[2] = createTextVNode(" 位得獎者", -1))
 				])]),
 				createBaseVNode("div", _hoisted_5, [createVNode(OStage_default)]),
-				_cache[2] || (_cache[2] = createBaseVNode("footer", null, "公平隨機抽選 · 名單不會上傳，僅留在你的裝置上", -1))
+				_cache[3] || (_cache[3] = createBaseVNode("footer", null, "公平隨機抽選 · 名單不會上傳，僅留在你的裝置上", -1))
 			]), createVNode(AToast_default, {
 				show: !!unref(message),
 				message: unref(message),
@@ -7109,7 +7161,7 @@ var LuckyDrawView_default = /*#__PURE__*/ _plugin_vue_export_helper_default(/* @
 			])], 64);
 		};
 	}
-}), [["__scopeId", "data-v-a87c9af8"]]);
+}), [["__scopeId", "data-v-73b44692"]]);
 //#endregion
 //#region src/router/index.ts
 var router = createRouter({
